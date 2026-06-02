@@ -9,47 +9,35 @@ const PORT = process.env.PORT || 3000;
 const PASS = process.env.APP_PASSWORD || 'marie2025';
 
 // ── Base de données SQLite ──────────────────────────────
-// Railway Volume : monter sur /data dans les settings Railway
-// DB_PATH doit pointer vers /data/marie.db
-// Si pas de volume, fallback sur /tmp (perdu au redémarrage mais au moins ça tourne)
+// Railway Volume DOIT être monté sur /data dans les settings
 function resolveDbPath() {
-  // 1. Variable d'environnement explicite
-  if (process.env.DB_PATH) {
-    const dir = path.dirname(process.env.DB_PATH);
+  const candidates = [
+    process.env.DB_PATH,          // variable explicite si définie
+    '/data/marie.db',             // Railway Volume monté sur /data
+  ].filter(Boolean);
+
+  for (const p of candidates) {
     try {
+      const dir = path.dirname(p);
       fs.mkdirSync(dir, { recursive: true });
-      // Test d'écriture
-      const testFile = path.join(dir, '.write_test');
-      fs.writeFileSync(testFile, 'ok');
-      fs.unlinkSync(testFile);
-      console.log(`DB path: ${process.env.DB_PATH}`);
-      return process.env.DB_PATH;
+      // Test écriture réel
+      const test = path.join(dir, '.writetest');
+      fs.writeFileSync(test, 'ok');
+      fs.unlinkSync(test);
+      console.log(`✅ DB path retenu : ${p}`);
+      return p;
     } catch(e) {
-      console.warn(`DB_PATH ${process.env.DB_PATH} non accessible: ${e.message}`);
+      console.warn(`⚠️  ${p} non accessible : ${e.message}`);
     }
   }
-  // 2. /data (Railway Volume monté automatiquement)
-  const dataPath = '/data/marie.db';
-  try {
-    fs.mkdirSync('/data', { recursive: true });
-    const testFile = '/data/.write_test';
-    fs.writeFileSync(testFile, 'ok');
-    fs.unlinkSync(testFile);
-    console.log(`DB path: ${dataPath} (volume /data)`);
-    return dataPath;
-  } catch(e) {
-    console.warn(`/data non accessible: ${e.message}`);
-  }
-  // 3. Fallback /tmp (éphémère mais fonctionnel)
-  console.warn('ATTENTION: DB en /tmp, données perdues au redémarrage !');
-  console.warn('Configurez un Volume Railway monté sur /data');
+  // Dernier recours — éphémère
+  console.warn('❌ AUCUN volume accessible — DB en /tmp (données perdues au redémarrage)');
+  console.warn('   → Créez un Volume Railway monté sur /data');
   return '/tmp/marie.db';
 }
 
 const dbPath = resolveDbPath();
 const db = new Database(dbPath);
-
-// WAL mode = meilleure fiabilité + performances
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 
@@ -79,7 +67,7 @@ db.exec(`
   );
 `);
 
-console.log('Base de données initialisée:', dbPath);
+console.log('Base initialisée :', dbPath);
 
 // ── Middleware ──────────────────────────────────────────
 app.use(express.json({ limit: '10mb' }));
@@ -88,19 +76,17 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'marie-secret-2025',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 30 * 24 * 60 * 60 * 1000 } // 30 jours
+  cookie: { maxAge: 30 * 24 * 60 * 60 * 1000 }
 }));
 
-// ── Auth middleware ─────────────────────────────────────
 function requireAuth(req, res, next) {
   if (req.session && req.session.auth) return next();
   res.status(401).json({ error: 'Non autorisé' });
 }
 
-// ── Login ───────────────────────────────────────────────
+// ── Auth ────────────────────────────────────────────────
 app.post('/api/login', (req, res) => {
-  const { password } = req.body;
-  if (password === PASS) {
+  if (req.body.password === PASS) {
     req.session.auth = true;
     res.json({ ok: true });
   } else {
@@ -128,56 +114,44 @@ app.get('/api/data', requireAuth, (req, res) => {
   res.json({ entries, conges, semtype, clients });
 });
 
-// Sync complet (remplace tout d'un coup)
 app.post('/api/sync', requireAuth, (req, res) => {
   const { entries = [], conges = [], semtype = [], clients = [] } = req.body;
-
   db.transaction(() => {
-    // Entries
     db.prepare('DELETE FROM entries').run();
-    const insEntry = db.prepare('INSERT INTO entries VALUES (?,?,?,?,?,?,?,?)');
-    entries.forEach(e => insEntry.run(
-      e.id, e.date, e.client, e.arr||'', e.dep||'', e.type, e.min||0, e.note||''
-    ));
+    const insE = db.prepare('INSERT INTO entries VALUES (?,?,?,?,?,?,?,?)');
+    entries.forEach(e => insE.run(e.id, e.date, e.client, e.arr||'', e.dep||'', e.type, e.min||0, e.note||''));
 
-    // Congés
     db.prepare('DELETE FROM conges').run();
-    const insCg = db.prepare('INSERT OR IGNORE INTO conges VALUES (?)');
-    conges.forEach(w => insCg.run(w));
+    const insC = db.prepare('INSERT OR IGNORE INTO conges VALUES (?)');
+    conges.forEach(w => insC.run(w));
 
-    // Semaine type
     db.prepare('DELETE FROM semtype').run();
-    const insSt = db.prepare('INSERT INTO semtype VALUES (?,?,?,?)');
-    semtype.forEach((day, di) => {
-      (day||[]).forEach((e, pos) => insSt.run(di, pos, e.client, e.type));
-    });
+    const insS = db.prepare('INSERT INTO semtype VALUES (?,?,?,?)');
+    semtype.forEach((day, di) => (day||[]).forEach((e, pos) => insS.run(di, pos, e.client, e.type)));
 
-    // Clients
     db.prepare('DELETE FROM clients').run();
     const insCl = db.prepare('INSERT OR IGNORE INTO clients VALUES (?)');
     clients.forEach(c => insCl.run(c));
   })();
 
-  res.json({ ok: true, counts: {
-    entries: entries.length,
-    conges: conges.length,
-    clients: clients.length
-  }});
+  res.json({ ok: true });
 });
 
-// Health check (utile pour Railway)
+// ── Health ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ ok: true, db: dbPath, entries: db.prepare('SELECT COUNT(*) as n FROM entries').get().n });
+  const n = db.prepare('SELECT COUNT(*) as n FROM entries').get().n;
+  const persistent = dbPath.startsWith('/data');
+  res.json({
+    ok: true,
+    db: dbPath,
+    persistent,
+    warning: persistent ? null : 'Données NON persistantes — montez un Volume sur /data',
+    entries: n
+  });
 });
 
-// ── Fichier HTML ────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// ── HTML ────────────────────────────────────────────────
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Démarrage ───────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Marie Heures démarré sur le port ${PORT}`);
-  console.log(`Base de données: ${dbPath}`);
-});
+app.listen(PORT, '0.0.0.0', () => console.log(`Démarré sur le port ${PORT} — DB: ${dbPath}`));
